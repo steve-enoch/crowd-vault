@@ -325,3 +325,109 @@
         (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
         
         ;; Update Investment Record
+        (map-set contributions {
+            campaign-id: campaign-id,
+            contributor: tx-sender,
+        } {
+            amount: new-amount,
+            refunded: false,
+            voting-power: (+ (get voting-power existing-contribution) voting-power),
+        })
+        
+        ;; Update Campaign Progress
+        (map-set campaigns { campaign-id: campaign-id }
+            (merge campaign { raised: (+ (get raised campaign) amount) })
+        )
+        
+        ;; Register Contributor
+        (try! (add-contributor-to-list campaign-id tx-sender))
+        (ok true)
+    )
+)
+
+;; Process successful campaign fund distribution
+(define-public (claim-funds (campaign-id uint))
+    (let (
+            (campaign (unwrap! (get-campaign campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+            (platform-fee (calculate-platform-fee (get raised campaign)))
+            (creator-amount (- (get raised campaign) platform-fee))
+        )
+        ;; Authorization & Status Validation
+        (asserts! (is-valid-campaign-id campaign-id) ERR_INVALID_PARAMETERS)
+        (update-campaign-status campaign-id)
+        (asserts! (is-eq (get creator campaign) tx-sender) ERR_UNAUTHORIZED)
+        (asserts! (>= stacks-block-height (get deadline-height campaign)) ERR_CAMPAIGN_ACTIVE)
+        (asserts! (is-campaign-successful campaign-id) ERR_GOAL_NOT_MET)
+        
+        ;; Governance Validation (if enabled)
+        (if (get voting-enabled campaign)
+            (begin
+                (asserts!
+                    (>= stacks-block-height (get voting-deadline-height campaign))
+                    ERR_VOTING_PERIOD_ENDED
+                )
+                (asserts!
+                    (> (get votes-for campaign) (get votes-against campaign))
+                    ERR_GOAL_NOT_MET
+                )
+            )
+            true
+        )
+        
+        ;; Fund Distribution
+        (try! (as-contract (stx-transfer? creator-amount tx-sender (get creator campaign))))
+        
+        ;; Platform Fee Collection
+        (if (> platform-fee u0)
+            (try! (as-contract (stx-transfer? platform-fee tx-sender CONTRACT_OWNER)))
+            true
+        )
+        
+        (ok true)
+    )
+)
+
+;; Process investment refund for failed campaigns
+(define-public (request-refund (campaign-id uint))
+    (let (
+            (campaign (unwrap! (get-campaign campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+            (contribution (unwrap! (get-contribution campaign-id tx-sender) ERR_NO_CONTRIBUTION))
+        )
+        ;; Refund Eligibility Validation
+        (asserts! (is-valid-campaign-id campaign-id) ERR_INVALID_PARAMETERS)
+        (update-campaign-status campaign-id)
+        (asserts! (not (get refunded contribution)) ERR_ALREADY_REFUNDED)
+        (asserts! (>= stacks-block-height (get deadline-height campaign)) ERR_CAMPAIGN_ACTIVE)
+        (asserts! (not (is-campaign-successful campaign-id)) ERR_GOAL_NOT_MET)
+        
+        ;; Process Refund
+        (map-set contributions {
+            campaign-id: campaign-id,
+            contributor: tx-sender,
+        }
+            (merge contribution { refunded: true })
+        )
+        
+        (try! (as-contract (stx-transfer? (get amount contribution) tx-sender tx-sender)))
+        (ok true)
+    )
+)
+
+;; Submit governance vote on campaign
+(define-public (vote
+        (campaign-id uint)
+        (vote-for bool)
+    )
+    (let (
+            (campaign (unwrap! (get-campaign campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+            (contribution (unwrap! (get-contribution campaign-id tx-sender) ERR_NO_CONTRIBUTION))
+            (existing-vote (map-get? contributor-votes {
+                campaign-id: campaign-id,
+                voter: tx-sender,
+            }))
+        )
+        ;; Voting Eligibility Validation
+        (asserts! (is-valid-campaign-id campaign-id) ERR_INVALID_PARAMETERS)
+        (asserts! (get voting-enabled campaign) ERR_UNAUTHORIZED)
+        (asserts! (>= stacks-block-height (get deadline-height campaign)) ERR_CAMPAIGN_ACTIVE)
+        (asserts! (< stacks-block-height (get voting-deadline-height campaign)) ERR_VOTING_PERIOD_ENDED)
